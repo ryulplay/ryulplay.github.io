@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no">
+		<title>슬라임 토스</title>
+		<style>
+html, body, #canvas {
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+
+body {
+	color: white;
+	background-color: black;
+	overflow: hidden;
+	touch-action: none;
+}
+
+#canvas {
+	display: block;
+}
+
+#canvas:focus {
+	outline: none;
+}
+
+#status, #status-splash, #status-progress {
+	position: absolute;
+	left: 0;
+	right: 0;
+}
+
+#status, #status-splash {
+	top: 0;
+	bottom: 0;
+}
+
+#status {
+	background-color: #f6f1de;
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+	align-items: center;
+	visibility: hidden;
+}
+
+#status-splash {
+	max-height: 100%;
+	max-width: 100%;
+	margin: auto;
+}
+
+#status-splash.show-image--false {
+	display: none;
+}
+
+#status-splash.fullsize--true {
+	height: 100%;
+	width: 100%;
+	object-fit: contain;
+}
+
+#status-splash.use-filter--false {
+	image-rendering: pixelated;
+}
+
+#status-progress, #status-notice {
+	display: none;
+}
+
+#status-progress {
+	bottom: 10%;
+	width: 50%;
+	margin: 0 auto;
+}
+
+#status-notice {
+	background-color: #5b3943;
+	border-radius: 0.5rem;
+	border: 1px solid #9b3943;
+	color: #e0e0e0;
+	font-family: 'Noto Sans', 'Droid Sans', Arial, sans-serif;
+	line-height: 1.3;
+	margin: 0 2rem;
+	overflow: hidden;
+	padding: 1rem;
+	text-align: center;
+	z-index: 1;
+}
+		</style>
+		<link id="-gd-engine-icon" rel="icon" type="image/png" href="index.icon.png" />
+<link rel="apple-touch-icon" href="index.apple-touch-icon.png"/>
+
+		<link rel="modulepreload" href="https://h5sdk.onestore.net/lib/v1.2.0/onestore-h5-sdk.min.js">
+	</head>
+	<body>
+		<canvas id="canvas">
+			Your browser does not support the canvas tag.
+		</canvas>
+
+		<noscript>
+			Your browser does not support JavaScript.
+		</noscript>
+
+		<div id="status">
+			<img id="status-splash" class="show-image--true fullsize--false use-filter--true" src="index.png" alt="">
+			<progress id="status-progress"></progress>
+			<div id="status-notice"></div>
+		</div>
+
+		<script>
+// window.slimeHost: the page side of scenes/web_host.gd, put into index.html by tools/build_web.py.
+// Plain-browser defaults here (no ads, no exit question); the Apps in Toss bundle fills in the Toss
+// parts with slimeHost.provide() (tossapp/src/main.js), the ONE store build with
+// tools/web/onestore_bridge.js. Runs no code made from strings.
+window.slimeHost = (function () {
+	var PACKS = ["extra.pck"];
+	// ONE store build only (build_web.py --target onestore): the engine waits for boot(), called by
+	// onestore_bridge.js once the store SDK has answered (its order: initializeAsync, then the
+	// loading progress, then startGameAsync). A page whose SDK never loads still starts on its own.
+	var HOLD = true;
+	var HOLD_MAX_MS = 10000;
+	var booted = !HOLD;
+	var bootWaiters = [];
+	var begun = false;
+	var impl = {};
+	var listener = null;
+	var queue = [];
+	var contexts = [];
+	var muted = {};
+	var engine = null;
+	// The engine's AudioContexts, so the sound can stop at once in the background and during ads
+	// (Apps in Toss launch guide) and come back afterwards.
+	var AC = window.AudioContext || window.webkitAudioContext;
+	if (AC) {
+		var Tracked = class extends AC {
+			constructor(opts) { super(opts); contexts.push(this); applyAudio(); }
+		};
+		window.AudioContext = Tracked;
+		if (window.webkitAudioContext) { window.webkitAudioContext = Tracked; }
+	}
+	function silent() {
+		if (document.hidden) { return true; }
+		for (var k in muted) { if (muted[k]) { return true; } }
+		return false;
+	}
+	function applyAudio() {
+		var off = silent();
+		contexts.forEach(function (c) {
+			try {
+				if (off && c.state === 'running') { c.suspend(); }
+				else if (!off && c.state === 'suspended') { c.resume().catch(function () {}); }
+			} catch (e) { console.warn('slimeHost audio', e); }
+		});
+	}
+	function emit(kind, detail) {
+		var d = detail === undefined || detail === null ? '' : String(detail);
+		if (listener) {
+			try { listener(kind, d); } catch (e) { console.error('slimeHost event', kind, e); }
+		} else {
+			queue.push([kind, d]);
+		}
+	}
+	document.addEventListener('visibilitychange', function () {
+		applyAudio();
+		emit(document.hidden ? 'hidden' : 'visible');
+	});
+	// Second packs (extra.pck): fetched once the first screen is up, then handed to the engine.
+	function fetchPack(name, tries) {
+		fetch(name).then(function (res) {
+			if (!res.ok) { throw new Error(name + ': HTTP ' + res.status); }
+			return res.arrayBuffer();
+		}).then(function (buf) {
+			var path = '/tmp/' + name;
+			engine.copyToFS(path, buf);
+			emit('pack', path);
+		}).catch(function (e) {
+			console.warn('slimeHost pack', e);
+			if (tries < 3) { setTimeout(function () { fetchPack(name, tries + 1); }, 5000 * (tries + 1)); }
+		});
+	}
+	function boot() {
+		if (booted) { return; }
+		booted = true;
+		var w = bootWaiters;
+		bootWaiters = [];
+		w.forEach(function (f) { f(); });
+	}
+	if (HOLD) { setTimeout(boot, HOLD_MAX_MS); }
+	// The engine's loading progress (0..100) for a store loading screen, and the hold above.
+	function wrapStart(e) {
+		var start = e.startGame.bind(e);
+		e.startGame = function (opts) {
+			var o = opts || {};
+			var shown = o.onProgress;
+			o.onProgress = function (current, total) {
+				if (shown) { shown(current, total); }
+				if (impl.progress && current > 0 && total > 0) { impl.progress(Math.min(99, Math.floor(current * 100 / total))); }
+			};
+			return new Promise(function (ok) {
+				if (booted) { ok(); } else { bootWaiters.push(ok); }
+			}).then(function () { return start(o); });
+		};
+	}
+	return {
+		provide: function (parts) { for (var k in parts) { impl[k] = parts[k]; } },
+		emit: emit,
+		mute: function (reason, on) { muted[reason] = !!on; applyAudio(); },
+		attach: function (e) { engine = e; if (HOLD) { wrapStart(e); } },
+		boot: boot,
+		hasStarted: function () { return begun; },
+		started: function () {
+			begun = true;
+			if (engine) { PACKS.forEach(function (n) { fetchPack(n, 0); }); }
+			if (impl.started) { impl.started(); }
+		},
+		info: function () {
+			var base = { toss: false, ads: false, units: {}, safe_top: 0 };
+			var more = impl.info ? impl.info() : {};
+			for (var k in more) { base[k] = more[k]; }
+			return JSON.stringify(base);
+		},
+		listen: function (cb) {
+			listener = cb;
+			var q = queue;
+			queue = [];
+			q.forEach(function (ev) { emit(ev[0], ev[1]); });
+		},
+		loadAd: function (id, cb) { if (impl.loadAd) { impl.loadAd(id, cb); } else { cb('error', 'no ads on this page'); } },
+		showAd: function (id, cb) { if (impl.showAd) { impl.showAd(id, cb); } else { cb('failed', 'no ads on this page'); } },
+		exit: function (title, body, stay, leave) { if (impl.exit) { impl.exit(title, body, stay, leave); } },
+		backup: function () { return impl.backup ? impl.backup() : '{}'; },
+		save: function (name, text) { if (impl.save) { impl.save(name, text); } },
+		haptic: function (type) { if (impl.haptic) { impl.haptic(type); } },
+		openUrl: function (url) { if (impl.openUrl) { impl.openUrl(url); } else { window.open(url, '_blank', 'noopener'); } },
+		// ONE store: when the copies were kept ({file name: ms}), whether the game takes the Android
+		// back key right now (the store asks synchronously, within 200 ms), and leaving the game.
+		stamps: function () { return impl.stamps ? impl.stamps() : '{}'; },
+		backMode: function (on) { if (impl.backMode) { impl.backMode(!!on); } },
+		quit: function () { if (impl.quit) { impl.quit(); } },
+	};
+})();
+</script>
+		<script type="module" id="onestore-bridge" src="onestore_bridge.js"></script>
+		<script>document.getElementById('onestore-bridge').addEventListener('error', function () { window.slimeHost.boot(); });</script>
+		<script>
+(function () {
+	var GZ = {"index.wasm": "application/wasm", "index.pck": "application/octet-stream"};
+	var plainFetch = window.fetch.bind(window);
+	function replay(reader, first) {
+		return new ReadableStream({
+			start: function (c) { if (first.value && first.value.length) { c.enqueue(first.value); } if (first.done) { c.close(); } },
+			pull: function (c) { return reader.read().then(function (r) { if (r.done) { c.close(); } else { c.enqueue(r.value); } }); },
+		});
+	}
+	window.fetch = function (input, init) {
+		var url = typeof input === 'string' ? input : (input && input.url) || '';
+		var name = url.split('?')[0].split('/').pop();
+		if (!GZ[name]) { return plainFetch(input, init); }
+		return plainFetch(url + '.gz', init).then(function (res) {
+			if (!res.ok) { return res; }
+			var reader = res.body.getReader();
+			return reader.read().then(function (first) {
+				var head = first.value || new Uint8Array(0);
+				var body = replay(reader, first);
+				if (head.length > 1 && head[0] === 0x1f && head[1] === 0x8b) {
+					if (typeof DecompressionStream !== 'function') { throw new Error('DecompressionStream unsupported'); }
+					body = body.pipeThrough(new DecompressionStream('gzip'));
+				}
+				return new Response(body, { status: 200, headers: { 'Content-Type': GZ[name] } });
+			});
+		});
+	};
+})();
+</script>
+		<script src="index.js"></script>
+		<script>
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":true,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":17095376,"index.wasm":24697968},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
+const GODOT_THREADS_ENABLED = false;
+const engine = new Engine(GODOT_CONFIG);
+window.slimeHost.attach(engine);
+
+(function () {
+	const statusOverlay = document.getElementById('status');
+	const statusProgress = document.getElementById('status-progress');
+	const statusNotice = document.getElementById('status-notice');
+
+	let initializing = true;
+	let statusMode = '';
+
+	function setStatusMode(mode) {
+		if (statusMode === mode || !initializing) {
+			return;
+		}
+		if (mode === 'hidden') {
+			statusOverlay.remove();
+			initializing = false;
+			return;
+		}
+		statusOverlay.style.visibility = 'visible';
+		statusProgress.style.display = mode === 'progress' ? 'block' : 'none';
+		statusNotice.style.display = mode === 'notice' ? 'block' : 'none';
+		statusMode = mode;
+	}
+
+	function setStatusNotice(text) {
+		while (statusNotice.lastChild) {
+			statusNotice.removeChild(statusNotice.lastChild);
+		}
+		const lines = text.split('\n');
+		lines.forEach((line) => {
+			statusNotice.appendChild(document.createTextNode(line));
+			statusNotice.appendChild(document.createElement('br'));
+		});
+	}
+
+	function displayFailureNotice(err) {
+		console.error(err);
+		if (err instanceof Error) {
+			setStatusNotice(err.message);
+		} else if (typeof err === 'string') {
+			setStatusNotice(err);
+		} else {
+			setStatusNotice('An unknown error occurred.');
+		}
+		setStatusMode('notice');
+		initializing = false;
+	}
+
+	const missing = Engine.getMissingFeatures({
+		threads: GODOT_THREADS_ENABLED,
+	});
+
+	if (missing.length !== 0) {
+		if (GODOT_CONFIG['serviceWorker'] && GODOT_CONFIG['ensureCrossOriginIsolationHeaders'] && 'serviceWorker' in navigator) {
+			let serviceWorkerRegistrationPromise;
+			try {
+				serviceWorkerRegistrationPromise = navigator.serviceWorker.getRegistration();
+			} catch (err) {
+				serviceWorkerRegistrationPromise = Promise.reject(new Error('Service worker registration failed.'));
+			}
+			// There's a chance that installing the service worker would fix the issue
+			Promise.race([
+				serviceWorkerRegistrationPromise.then((registration) => {
+					if (registration != null) {
+						return Promise.reject(new Error('Service worker already exists.'));
+					}
+					return registration;
+				}).then(() => engine.installServiceWorker()),
+				// For some reason, `getRegistration()` can stall
+				new Promise((resolve) => {
+					setTimeout(() => resolve(), 2000);
+				}),
+			]).then(() => {
+				// Reload if there was no error.
+				window.location.reload();
+			}).catch((err) => {
+				console.error('Error while registering service worker:', err);
+			});
+		} else {
+			// Display the message as usual
+			const missingMsg = 'Error\nThe following features required to run Godot projects on the Web are missing:\n';
+			displayFailureNotice(missingMsg + missing.join('\n'));
+		}
+	} else {
+		setStatusMode('progress');
+		engine.startGame({
+			'onProgress': function (current, total) {
+				if (current > 0 && total > 0) {
+					statusProgress.value = current;
+					statusProgress.max = total;
+				} else {
+					statusProgress.removeAttribute('value');
+					statusProgress.removeAttribute('max');
+				}
+			},
+		}).then(() => {
+			setStatusMode('hidden');
+			window.slimeHost.started();
+		}, displayFailureNotice);
+	}
+}());
+		</script>
+	</body>
+</html>
+
